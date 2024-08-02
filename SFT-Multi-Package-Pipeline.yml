@@ -1,0 +1,117 @@
+parameters: 
+  tests: ''
+  packages: ''
+
+jobs:
+- job: SFT_Automation_POC
+  timeoutInMinutes: 0
+  pool:
+    name: SFT-Automation
+    #name : Reboot-Testing
+    demands:
+      - agent.name -equals ${{ parameters.AgentName }}
+  steps:
+  - script: '%windir%\System32\tscon.exe 1 /dest:console'
+    displayName: Close Remote Desktop Connections
+    continueOnError: true
+  - task: CmdLine@2
+    inputs:
+      script: if exist $(WorkingFolder) rmdir /Q /S $(WorkingFolder)
+    displayName: Wiping Out the working directory     
+  - template: ../steps/copy-files.yml
+    parameters:
+      Contents: '**'
+      SourceFolder: $(Build.SourcesDirectory)
+      TargetFolder: $(WorkingFolder)
+  - task: PythonScript@0
+    displayName: 'Install vcodev'
+    inputs:
+      scriptPath: '$(WorkingFolder)/Vcodev_Install.py'
+      arguments: '$(WorkingFolder)'
+  - template: ../steps/install-nuget-tool.yml
+  # - task: CmdLine@2
+  #   inputs:
+  #     script: if exist C:\nuget-packages\Install rmdir /Q /S C:\nuget-packages\Install
+  #   displayName: 'Wiping Out the Packages Install Directory'
+  #   continueOnError: true
+  # - '${{ each package in parameters.packages }}':
+  #     - powershell: |
+  #         $packageOld = '${{ package }}'
+  #         Write-Host "Current Package Name : [$packageOld]"
+  #         $packageName = ($packageOld -split "-")[0]
+  #         $packageVersion = ($packageOld -split "-")[1]
+  #         $packageFolderName = ($packageOld -split "-")[2]
+  #         Write-Host "##vso[task.setvariable variable=packageName]$packageName"
+  #         Write-Host "##vso[task.setvariable variable=packageVersion]$packageVersion"
+  #         Write-Host "##vso[task.setvariable variable=packageFolderName]$packageFolderName"
+  #       displayName: 'Get the package name'
+  #     - task: DownloadPackage@1
+  #       displayName: 'Download Nuget Package'
+  #       inputs:
+  #         feed: 'public-signed'
+  #         definition: '$(packageName)'
+  #         version: '$(packageVersion)'
+  #         downloadPath: 'C:\nuget-packages\Install\$(packageFolderName)'
+  - powershell: 'Get-ChildItem -Path C:\nuget-packages\Install -Recurse -Force'
+    displayName: 'List all Packages'
+  - '${{ each test in parameters.tests }}':
+      - powershell: |
+          $testCasePath = '${{ test }}'
+          Write-Host "Current Test Case Path : [$testCasePath]"
+          $testCase = ($testCasePath -split "\\")[2]
+          Write-Host "Current Test Case : [$testCase]"
+          Write-Host "##vso[task.setvariable variable=testCase]$testCase"
+        displayName: 'Get the Test Case Name'
+      - task: CmdLine@2
+        displayName: Execute vvv pack for ${{ test }}
+        inputs:
+          script: vd -vvv pack $(WorkingFolder)\test-case\${{ test }}
+          workingDirectory: $(WorkingFolder)
+      - task: ExtractFiles@1
+        displayName: 'Extract files from ${{ test }} '
+        inputs:
+          archiveFilePatterns: $(WorkingFolder)/*$(testCase)*.zip
+          destinationFolder: $(WorkingFolder)\$(testCase)
+          cleanDestinationFolder: false
+      - powershell: echo "##vso[task.setvariable variable=myOutputVar]$env:TEMP"
+        displayName: Set task variable
+      - template: ../steps/copy-files.yml
+        parameters:
+          Contents: DownloadConfig.json
+          SourceFolder: $(WorkingFolder)\$(testCase)
+          TargetFolder: $(myOutputVar)
+      - task: CmdLine@2
+        displayName: Test-Run ${{ test }}
+        inputs:
+          script: $(WorkingFolder)\$(testCase)\RobotScript.bat
+          workingDirectory: $(WorkingFolder)\$(testCase)
+      - powershell: |
+          $destinationFolder = "$(WorkingFolder)\Publish"
+          if (!(Test-Path -path $destinationFolder)) {New-Item $destinationFolder -Type Directory}
+          Copy-Item "$(WorkingFolder)\$(testCase)\LOGS\log.html" -Destination "$(build.artifactstagingdirectory)\$(testCase).html"
+        displayName: 'Copy HTML File'
+      - template: ../steps/pipeline-build-artifact-publish.yml
+        parameters:
+          artifactName: 'SFT-POC'
+      - task: PythonScript@0
+        displayName: Determining the Errors for ${{ test }}
+        continueOnError: true
+        inputs:
+          scriptPath: $(WorkingFolder)\ReadLog.py
+          arguments: $(WorkingFolder)\$(testCase)
+      - powershell: |
+          $destinationFolder = "$(WorkingFolder)\Publish"
+          if (!(Test-Path -path $destinationFolder)) {New-Item $destinationFolder -Type Directory}
+          Copy-Item "$(WorkingFolder)\$(testCase)\RESULTS\outputXunit.xml" -Destination "$destinationFolder\$(testCase).xml"
+        displayName: 'Copy XML File'
+        continueOnError: true
+  - task: PythonScript@0
+    displayName: 'Merge XML Files'
+    inputs:
+      scriptPath: '$(WorkingFolder)\MergeXml.py'
+      arguments: '$(WorkingFolder)\Publish'
+  - task: PublishTestResults@2
+    displayName: 'Publish Test Results'
+    inputs:
+      testResultsFiles: merged.xml
+      searchFolder: '$(WorkingFolder)\Publish'
